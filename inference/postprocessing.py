@@ -8,14 +8,16 @@ try:
 except ImportError:
     CYTHON_NMS_AVAILABLE = False
     
-    def cnms(boxes, scores, iou_threshold):
+    def cnms(dets, iou_threshold):
         """Pure Python NMS fallback implementation"""
-        if len(boxes) == 0:
-            return []
+        # Convert to numpy array first
+        dets = np.array(dets, dtype=np.float32)
         
-        # Convert to numpy arrays
-        boxes = np.array(boxes, dtype=np.float32)
-        scores = np.array(scores, dtype=np.float32)
+        if dets.shape[0] == 0:
+            return np.array([], dtype=np.int64)
+        
+        boxes = dets[:, :4]  # x1, y1, x2, y2
+        scores = dets[:, 4]  # confidence scores
         
         # Get indices sorted by scores (descending)
         indices = np.argsort(scores)[::-1]
@@ -44,7 +46,7 @@ except ImportError:
             # Keep only boxes with IoU less than threshold
             indices = indices[1:][ious < iou_threshold]
         
-        return keep
+        return np.array(keep, dtype=np.int64)
 
     def calculate_iou(box1, box2):
         """Calculate Intersection over Union (IoU) of two bounding boxes"""

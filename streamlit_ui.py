@@ -13,10 +13,79 @@ from pathlib import Path
 from PIL import Image
 import tempfile
 from functools import partial
+import json
 
 # Load environment variables from .env file
 from dotenv import load_dotenv
 load_dotenv()
+
+# Shared state file for cross-session communication
+SHARED_STATE_FILE = os.path.join(tempfile.gettempdir(), 'anpr_shared_state.json')
+
+def get_shared_recording_state():
+    """Get the current recording state shared across all sessions"""
+    try:
+        if os.path.exists(SHARED_STATE_FILE):
+            with open(SHARED_STATE_FILE, 'r') as f:
+                data = json.load(f)
+                return data.get('recording', False), data.get('timestamp', 0), data.get('ffmpeg_pid', None)
+        return False, 0, None
+    except (json.JSONDecodeError, FileNotFoundError, PermissionError, IOError):
+        return False, 0, None
+
+def set_shared_recording_state(recording, ffmpeg_pid=None):
+    """Set the recording state shared across all sessions"""
+    try:
+        data = {
+            'recording': recording, 
+            'timestamp': time.time(),
+            'ffmpeg_pid': ffmpeg_pid
+        }
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(SHARED_STATE_FILE), exist_ok=True)
+        
+        # Write atomically by writing to temp file then moving
+        temp_file = SHARED_STATE_FILE + '.tmp'
+        with open(temp_file, 'w') as f:
+            json.dump(data, f)
+        os.rename(temp_file, SHARED_STATE_FILE)
+        
+    except (PermissionError, IOError, OSError):
+        pass  # Silently fail if we can't write to temp directory
+
+def stop_recording_by_pid(pid):
+    """Stop recording process by PID (works across sessions)"""
+    if pid is None:
+        return False
+    
+    try:
+        # Try to terminate the process gracefully
+        os.kill(pid, signal.SIGINT)
+        
+        # Wait a bit for graceful shutdown
+        time.sleep(2)
+        
+        # Check if process is still running
+        try:
+            os.kill(pid, 0)  # This doesn't kill, just checks if process exists
+            # Process still exists, force kill
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            # Process is already dead
+            pass
+            
+        return True
+    except (OSError, ProcessLookupError):
+        # Process doesn't exist or we don't have permission
+        return False
+
+def cleanup_shared_state():
+    """Clean up shared state file"""
+    try:
+        if os.path.exists(SHARED_STATE_FILE):
+            os.remove(SHARED_STATE_FILE)
+    except PermissionError:
+        pass
 
 # Import from our standalone package structure
 try:
@@ -91,7 +160,6 @@ translations = {
         "crops_saved": "📸 Saved crops:",
         "moved_to_processed": "📁 Moved to processed directory:",
         "processing_error": "❌ Error processing video:",
-        "model_not_loaded": "❌ Model not loaded. Using demo mode.",
         "demo_inference": "ℹ️ This is a demo UI. Connect your actual inference code here.",
         "inference_completed": "✅ Inference completed!",
         "inference_status": "**Inference Status:** ✅ Ready for postprocessing",
@@ -116,15 +184,7 @@ translations = {
         "download_result": "💾 Download Result",
         "download_processed": "⬇️ Download Processed Image",
         "clear_results": "🗑️ Clear All Results",
-        "footer": "**Car Loan Detector** | Built with Streamlit 🚀",
-        "model_config": "Model Configuration",
-        "model_path": "Model Path (HEF file)",
-        "architecture": "Architecture",
-        "load_model": "🚀 Load Model",
-        "model_loaded": "✅ Model loaded successfully!",
-        "model_load_error": "❌ Error loading model:",
-        "model_not_found": "❌ Model file not found:",
-        "model_status": "Model Status"
+        "footer": "**Car Loan Detector** | Built with Streamlit 🚀"
     },
     "no": {
         "page_title": "Billån Detektor",
@@ -161,9 +221,6 @@ translations = {
         "crops_saved": "📸 Lagret utsnitt:",
         "moved_to_processed": "📁 Flyttet til behandlet mappe:",
         "processing_error": "❌ Feil ved behandling av video:",
-        "model_not_loaded": "❌ Modell ikke lastet. Bruker demo-modus.",
-        "demo_inference": "ℹ️ Dette er en demo-UI. Koble til din faktiske slutningskode her.",
-        "inference_completed": "✅ Slutning fullført!",
         "demo_inference": "ℹ️ Dette er en demo-UI. Koble til din faktiske inferenceskode her.",
         "inference_completed": "✅ inference fullført!",
         "inference_status": "**inferencesstatus:** ✅ Klar for etterbehandling",
@@ -188,15 +245,7 @@ translations = {
         "download_result": "💾 Last ned resultat",
         "download_processed": "⬇️ Last ned behandlet bilde",
         "clear_results": "🗑️ Tøm alle resultater",
-        "footer": "**Billån Detektor** | Bygget med Streamlit 🚀",
-        "model_config": "Modellkonfigurasjon",
-        "model_path": "Modellsti (HEF-fil)",
-        "architecture": "Arkitektur",
-        "load_model": "🚀 Last modell",
-        "model_loaded": "✅ Modell lastet vellykket!",
-        "model_load_error": "❌ Feil ved lasting av modell:",
-        "model_not_found": "❌ Modellfil ikke funnet:",
-        "model_status": "Modellstatus"
+        "footer": "**Billån Detektor** | Bygget med Streamlit 🚀"
     }
 }
 
@@ -519,7 +568,9 @@ if 'processed_result' not in st.session_state:
 if 'ffmpeg_process' not in st.session_state:
     st.session_state.ffmpeg_process = None
 if 'recording' not in st.session_state:
-    st.session_state.recording = False
+    # Check shared state to sync with other sessions
+    shared_recording, _, _ = get_shared_recording_state()
+    st.session_state.recording = shared_recording
 if 'language' not in st.session_state:
     st.session_state.language = 'en'
 if 'model_path' not in st.session_state:
@@ -530,6 +581,20 @@ if 'hailo_inference' not in st.session_state:
     st.session_state.hailo_inference = None
 if 'anpr_result' not in st.session_state:
     st.session_state.anpr_result = None
+
+# Auto-load model with defaults if not already loaded
+if st.session_state.hailo_inference is None and HAILO_AVAILABLE:
+    model_path_expanded = os.path.expanduser(st.session_state.model_path)
+    if os.path.exists(model_path_expanded):
+        try:
+            st.session_state.hailo_inference = HailoInfer(
+                model_path_expanded,
+                batch_size=1,
+                output_type="FLOAT32"
+            )
+        except Exception:
+            # Silently continue if model loading fails
+            pass
 
 # Language selector
 language = st.selectbox(
@@ -548,57 +613,10 @@ t = translations[st.session_state.language]
 st.title(t["main_title"])
 st.markdown(t["subtitle"])
 
-# Sidebar for model configuration
-st.sidebar.header(t["model_config"])
-
-# Model path input
-model_path = st.sidebar.text_input(
-    t["model_path"],
-    value=st.session_state.model_path,
-    help="Path to your Hailo HEF model file"
-)
-st.session_state.model_path = model_path
-
-# Architecture selection
-architecture = st.sidebar.selectbox(
-    t["architecture"],
-    options=['fast', 'v5', 'v8'],
-    index=['fast', 'v5', 'v8'].index(st.session_state.architecture),
-    help="Model architecture type"
-)
-st.session_state.architecture = architecture
-
-# Load model button
-if st.sidebar.button(t["load_model"]):
-    model_path_expanded = os.path.expanduser(st.session_state.model_path)
-    if os.path.exists(model_path_expanded):
-        try:
-            with st.spinner("Loading Hailo model..."):
-                st.session_state.hailo_inference = HailoInfer(
-                    model_path_expanded,
-                    batch_size=1,
-                    output_type="FLOAT32"
-                )
-            st.sidebar.success(t["model_loaded"])
-        except Exception as e:
-            st.sidebar.error(f"{t['model_load_error']} {str(e)}")
-            st.session_state.hailo_inference = None
-    else:
-        st.sidebar.error(f"{t['model_not_found']} {model_path_expanded}")
-
-# Model status display
-st.sidebar.subheader(t["model_status"])
-if st.session_state.hailo_inference is not None:
-    st.sidebar.success("✅ Model loaded and ready")
-    st.sidebar.info(f"Architecture: {st.session_state.architecture}")
-    st.sidebar.info(f"Model: {os.path.basename(st.session_state.model_path)}")
-else:
-    st.sidebar.warning("⚠️ No model loaded (demo mode)")
-
-st.sidebar.markdown("---")
-
 # Configuration
 arch_type = "fast"  # Default architecture type
+
+# Add refresh button to sync state across sessions\ncol_refresh, col_debug, col_empty = st.columns([1, 1, 3])\nwith col_refresh:\n    if st.button(\"🔄 Refresh\", help=\"Sync with other browser tabs\"):\n        st.rerun()\n\nwith col_debug:\n    # Debug info\n    shared_recording, shared_timestamp = get_shared_recording_state()\n    if st.button(\"🐛 Debug\", help=\"Show debug info\"):\n        st.write(f\"Local recording: {st.session_state.recording}\")\n        st.write(f\"Shared recording: {shared_recording}\")\n        st.write(f\"Shared timestamp: {shared_timestamp}\")\n        st.write(f\"File exists: {os.path.exists(SHARED_STATE_FILE)}\")\n        if os.path.exists(SHARED_STATE_FILE):\n            st.write(f\"File content: {open(SHARED_STATE_FILE).read()}\")
 
 # Main UI with three columns for the three steps
 col1, col2, col3 = st.columns(3)
@@ -606,6 +624,31 @@ col1, col2, col3 = st.columns(3)
 # Step 1: Capture
 with col1:
     st.header(t["step1_capture"])
+    
+    # Sync with shared state on each page load
+    shared_recording, shared_timestamp, shared_pid = get_shared_recording_state()
+    
+    # Update local state if shared state has changed
+    if shared_recording != st.session_state.recording:
+        st.session_state.recording = shared_recording
+        if not shared_recording:
+            # Recording was stopped in another session
+            st.session_state.ffmpeg_process = None
+    
+    # Validate that recording process is actually still running (only if we have a process object)
+    if st.session_state.recording and hasattr(st.session_state, 'ffmpeg_process') and st.session_state.ffmpeg_process:
+        try:
+            # Check if process is still alive
+            if st.session_state.ffmpeg_process.poll() is not None:
+                # Process has terminated
+                st.session_state.recording = False
+                set_shared_recording_state(False)
+                st.session_state.ffmpeg_process = None
+        except (AttributeError, OSError):
+            # Process object is invalid or no longer exists
+            st.session_state.recording = False
+            set_shared_recording_state(False)
+            st.session_state.ffmpeg_process = None
     
     # Recording status
     if st.session_state.recording:
@@ -662,6 +705,8 @@ with col1:
                     stderr=subprocess.PIPE
                 )
                 st.session_state.recording = True
+                ffmpeg_pid = st.session_state.ffmpeg_process.pid if st.session_state.ffmpeg_process else None
+                set_shared_recording_state(True, ffmpeg_pid)
                 st.success(t["recording_started"])
                 st.rerun()
                 
@@ -675,23 +720,42 @@ with col1:
     with col_stop:
         if st.button(t["stop_recording"], use_container_width=True, disabled=not st.session_state.recording):
             try:
-                if st.session_state.ffmpeg_process:
-                    # Send SIGINT to ffmpeg for clean shutdown
-                    st.session_state.ffmpeg_process.send_signal(signal.SIGINT)
-                    
-                    # Wait for process to finish (with timeout)
+                # Get shared state to find the PID
+                shared_recording, shared_timestamp, shared_pid = get_shared_recording_state()
+                
+                stopped = False
+                
+                # Try to stop using local process object first
+                if hasattr(st.session_state, 'ffmpeg_process') and st.session_state.ffmpeg_process:
                     try:
-                        st.session_state.ffmpeg_process.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        # Force kill if it doesn't stop gracefully
-                        st.session_state.ffmpeg_process.kill()
-                        st.session_state.ffmpeg_process.wait()
-                    
-                    st.session_state.ffmpeg_process = None
+                        # Send SIGINT to ffmpeg for clean shutdown
+                        st.session_state.ffmpeg_process.send_signal(signal.SIGINT)
+                        
+                        # Wait for process to finish (with timeout)
+                        try:
+                            st.session_state.ffmpeg_process.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            # Force kill if it doesn't stop gracefully
+                            st.session_state.ffmpeg_process.kill()
+                            st.session_state.ffmpeg_process.wait()
+                        
+                        st.session_state.ffmpeg_process = None
+                        stopped = True
+                    except Exception:
+                        pass  # Fall back to PID method
+                
+                # If local process didn't work, try using PID from shared state
+                if not stopped and shared_pid:
+                    stopped = stop_recording_by_pid(shared_pid)
+                
+                if stopped:
                     st.session_state.recording = False
+                    set_shared_recording_state(False)
                     st.success(t["recording_stopped"])
                     st.info(t["video_saved"])
                     st.rerun()
+                else:
+                    st.error("Failed to stop recording - process may have already ended")
                 
             except Exception as e:
                 st.error(f"{t['stop_error']} {str(e)}")
@@ -749,8 +813,6 @@ with col2:
                 # Show inference mode
                 if st.session_state.hailo_inference is not None:
                     st.info(f"🧠 Using real inference with {st.session_state.architecture} architecture")
-                else:
-                    st.warning("⚠️ Running in demo mode - load model for real inference")
                 
                 with st.spinner(t["processing_videos"]):
                     processed_files, total_crops = process_video_files()
