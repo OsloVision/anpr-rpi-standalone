@@ -503,13 +503,14 @@ def process_crops_with_anpr():
                     if registry_status in ["yes", "partial"]:
                         registry_matches += 1
                         st.write(f"✅ Registry match: {license_plate_text} -> {registry_status}")
+                        
+                        # Only save to database if we have actual vehicle data
+                        success = upsert_loan_status(license_plate_text, registry_status, registry_info, db_path)
+                        if success:
+                            database_records += 1
                     else:
                         st.write(f"❌ No registry match: {license_plate_text} -> {registry_status}")
-                    
-                    # Save to database
-                    success = upsert_loan_status(license_plate_text, registry_status, registry_info, db_path)
-                    if success:
-                        database_records += 1
+                        # Don't add to database if no vehicle data is available
                 
                 # Move processed crop to processed-crops directory
                 dest_path = os.path.join(processed_crops_dir, crop_filename)

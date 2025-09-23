@@ -481,10 +481,14 @@ def main():
 
             print(f"Norwegian registry: {registry_result}")
 
-            # Upsert into database
-            upsert_loan_status(
-                license_plate_text, registry_result, registry_info, args.db_path
-            )
+            # Upsert into database only if we have vehicle data
+            if registry_result == "yes":
+                upsert_loan_status(
+                    license_plate_text, registry_result, registry_info, args.db_path
+                )
+                print(f"💾 Added to database: {license_plate_text} -> {registry_result}")
+            else:
+                print(f"ℹ️ No vehicle data found, not adding to database: {registry_result}")
 
     except KeyboardInterrupt:
         print("\nOperation cancelled by user.", file=sys.stderr)
