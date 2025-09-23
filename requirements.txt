@@ -1,0 +1,29 @@
+# Core Application Dependencies
+streamlit>=1.28.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=9.5.0
+python-dotenv>=1.0.0
+scipy>=1.10.0
+
+# ANPR Dependencies
+openai>=1.0.0
+requests>=2.25.0
+pydantic>=2.0.0
+
+# Video Processing
+ffmpeg-python>=0.2.0
+
+# Optional Dependencies (install if using Hailo)
+# hailo-platform-sdk  # Install separately if using Hailo hardware
+
+# Development Dependencies (optional)
+pytest>=7.0.0
+black>=23.0.0
+flake8>=6.0.0
+mypy>=1.0.0
+
+# Alternative Inference Backends (optional)
+# onnxruntime>=1.15.0
+# tensorflow>=2.13.0
+# torch>=2.0.0

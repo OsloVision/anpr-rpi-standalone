@@ -1,0 +1,926 @@
+#!/usr/bin/env python3
+import streamlit as st
+import cv2
+import numpy as np
+import os
+import sys
+import subprocess
+import signal
+import time
+import shutil
+import glob
+from pathlib import Path
+from PIL import Image
+import tempfile
+from functools import partial
+
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()
+
+# Import from our standalone package structure
+try:
+    from hailo.hailo_inference import HailoInfer
+    from hailo.toolbox import load_json_file, get_labels, default_preprocess
+    from hailo import HAILO_AVAILABLE
+except ImportError:
+    HailoInfer = None
+    HAILO_AVAILABLE = False
+    # Fallback functions for when Hailo is not available
+    def load_json_file(path):
+        import json
+        with open(path, 'r') as f:
+            return json.load(f)
+    
+    def get_labels(config, arch):
+        return ["vehicle", "license_plate"]
+    
+    def default_preprocess(image, width, height):
+        return cv2.resize(image, (width, height))
+
+from inference.postprocessing import inference_result_handler, decode_and_postprocess
+
+# Import ANPR functionality
+from anpr.license_plate_reader import read_license_plate, check_both_norwegian_services, upsert_loan_status
+from anpr.loan_db_utils import LoanStatusDB
+
+# Import utility functions
+from utils.inference_engine import create_inference_engine
+from utils.video_utils import (
+    process_video_file, 
+    setup_camera_recording, 
+    start_ffmpeg_recording, 
+    stop_ffmpeg_recording,
+    save_detection_crops
+)
+
+# Translations dictionary
+translations = {
+    "en": {
+        "page_title": "Car Loan Detector",
+        "main_title": "🚗 Car Loan Detector",
+        "subtitle": "Plug in a USB camera and drive around in traffic to get lots of videos to process. Then you can run inference on the videos, and then postprocessing which includes OCR with OpenAI and lookups to Norwegian vehicle databases.",
+        "language": "Language",
+        "step1_capture": "1️⃣ Capture",
+        "step2_infer": "2️⃣ Infer", 
+        "step3_postprocess": "3️⃣ Postprocess",
+        "recording_in_progress": "🔴 Recording in progress...",
+        "click_stop": "Click 'Stop Recording' to finish capture",
+        "ready_to_record": "📹 Ready to start recording",
+        "start_recording": "📸 Start Recording",
+        "stop_recording": "⏹️ Stop Recording",
+        "setting_camera": "Setting camera focus controls...",
+        "starting_video": "Starting video recording...",
+        "recording_started": "✅ Recording started successfully!",
+        "camera_error": "❌ Camera control error:",
+        "not_found_error": "❌ v4l2-ctl or ffmpeg not found. Please install v4l-utils and ffmpeg.",
+        "start_error": "❌ Error starting recording:",
+        "recording_stopped": "✅ Recording stopped!",
+        "video_saved": "📁 Video files saved to ~/video-capture/output_*.mp4",
+        "stop_error": "❌ Error stopping recording:",
+        "recent_captures": "Recent Captures",
+        "no_videos": "No video files found",
+        "output_not_found": "Output directory not found",
+        "list_error": "Error listing files:",
+        "run_inference": "🧠 Run Inference",
+        "capture_first": "❌ Please capture an image first!",
+        "processing_videos": "🎬 Processing video files...",
+        "no_videos_to_process": "ℹ️ No video files found to process",
+        "processing_video": "Processing video:",
+        "video_processed": "✅ Video processed successfully:",
+        "crops_saved": "📸 Saved crops:",
+        "moved_to_processed": "📁 Moved to processed directory:",
+        "processing_error": "❌ Error processing video:",
+        "model_not_loaded": "❌ Model not loaded. Using demo mode.",
+        "demo_inference": "ℹ️ This is a demo UI. Connect your actual inference code here.",
+        "inference_completed": "✅ Inference completed!",
+        "inference_status": "**Inference Status:** ✅ Ready for postprocessing",
+        "postprocess_results": "🎨 Postprocess Results",
+        "run_postprocessing": "🎨 Run ANPR Postprocessing",
+        "processing_crops": "🔍 Processing crops with ANPR...",
+        "crops_processed": "📊 Crops processed:",
+        "plates_found": "🔢 License plates found:",
+        "registry_matches": "✅ Registry matches:",
+        "database_records": "💾 Database records updated:",
+        "crops_moved": "📁 Crops moved to processed directory:",
+        "anpr_completed": "✅ ANPR postprocessing completed!",
+        "no_crops_found": "ℹ️ No crop images found. Please run inference first.",
+        "openai_key_missing": "❌ OpenAI API key required for ANPR. Please set OPENAI_API_KEY environment variable.",
+        "run_inference_first": "❌ Please run inference first!",
+        "no_image": "❌ No captured image available!",
+        "demo_postprocess": "ℹ️ This is a demo UI. Connect your actual postprocessing code here.",
+        "postprocess_completed": "✅ Postprocessing completed!",
+        "results": "📊 Results",
+        "original_image": "Original Image",
+        "segmentation_result": "Instance Segmentation Result",
+        "download_result": "💾 Download Result",
+        "download_processed": "⬇️ Download Processed Image",
+        "clear_results": "🗑️ Clear All Results",
+        "footer": "**Car Loan Detector** | Built with Streamlit 🚀",
+        "model_config": "Model Configuration",
+        "model_path": "Model Path (HEF file)",
+        "architecture": "Architecture",
+        "load_model": "🚀 Load Model",
+        "model_loaded": "✅ Model loaded successfully!",
+        "model_load_error": "❌ Error loading model:",
+        "model_not_found": "❌ Model file not found:",
+        "model_status": "Model Status"
+    },
+    "no": {
+        "page_title": "Billån Detektor",
+        "main_title": "🚗 Billån Detektor",
+        "subtitle": "Last opp et bilde og kjør instanssegmentering med tre-trinns prosess",
+        "language": "Språk",
+        "step1_capture": "1️⃣ Opptak",
+        "step2_infer": "2️⃣ Slutt",
+        "step3_postprocess": "3️⃣ Etterbehandle",
+        "recording_in_progress": "🔴 Opptak pågår...",
+        "click_stop": "Klikk 'Stopp opptak' for å fullføre opptak",
+        "ready_to_record": "📹 Klar til å starte opptak",
+        "start_recording": "📸 Start opptak",
+        "stop_recording": "⏹️ Stopp opptak",
+        "setting_camera": "Setter kamerafokuskontroller...",
+        "starting_video": "Starter videoopptak...",
+        "recording_started": "✅ Opptak startet vellykket!",
+        "camera_error": "❌ Kamerakontrollfeil:",
+        "not_found_error": "❌ v4l2-ctl eller ffmpeg ikke funnet. Vennligst installer v4l-utils og ffmpeg.",
+        "start_error": "❌ Feil ved start av opptak:",
+        "recording_stopped": "✅ Opptak stoppet!",
+        "video_saved": "📁 Videofiler lagret til ~/video-capture/output_*.mp4",
+        "stop_error": "❌ Feil ved stopp av opptak:",
+        "recent_captures": "Nylige opptak",
+        "no_videos": "Ingen videofiler funnet",
+        "output_not_found": "Utdatamappe ikke funnet",
+        "list_error": "Feil ved listing av filer:",
+        "run_inference": "🧠 Kjør inference",
+        "capture_first": "❌ Vennligst ta opp et bilde først!",
+        "processing_videos": "🎬 Behandler videofiler...",
+        "no_videos_to_process": "ℹ️ Ingen videofiler funnet å behandle",
+        "processing_video": "Behandler video:",
+        "video_processed": "✅ Video behandlet vellykket:",
+        "crops_saved": "📸 Lagret utsnitt:",
+        "moved_to_processed": "📁 Flyttet til behandlet mappe:",
+        "processing_error": "❌ Feil ved behandling av video:",
+        "model_not_loaded": "❌ Modell ikke lastet. Bruker demo-modus.",
+        "demo_inference": "ℹ️ Dette er en demo-UI. Koble til din faktiske slutningskode her.",
+        "inference_completed": "✅ Slutning fullført!",
+        "demo_inference": "ℹ️ Dette er en demo-UI. Koble til din faktiske inferenceskode her.",
+        "inference_completed": "✅ inference fullført!",
+        "inference_status": "**inferencesstatus:** ✅ Klar for etterbehandling",
+        "postprocess_results": "🎨 Etterbehandle resultater",
+        "run_postprocessing": "🎨 Kjør ANPR etterbehandling",
+        "processing_crops": "🔍 Behandler beskjæringer med ANPR...",
+        "crops_processed": "📊 Beskjæringer behandlet:",
+        "plates_found": "🔢 Skiltnumre funnet:",
+        "registry_matches": "✅ Registertreff:",
+        "database_records": "💾 Databaseposter oppdatert:",
+        "crops_moved": "📁 Beskjæringer flyttet til behandlet mappe:",
+        "anpr_completed": "✅ ANPR etterbehandling fullført!",
+        "no_crops_found": "ℹ️ Ingen beskjæringsbilder funnet. Kjør slutning først.",
+        "openai_key_missing": "❌ OpenAI API-nøkkel påkrevd for ANPR. Vennligst sett OPENAI_API_KEY miljøvariabel.",
+        "run_inference_first": "❌ Vennligst kjør inference først!",
+        "no_image": "❌ Ingen tatt bilde tilgjengelig!",
+        "demo_postprocess": "ℹ️ Dette er en demo-UI. Koble til din faktiske etterbehandlingskode her.",
+        "postprocess_completed": "✅ Etterbehandling fullført!",
+        "results": "📊 Resultater",
+        "original_image": "Originalt bilde",
+        "segmentation_result": "Instanssegmenteringsresultat",
+        "download_result": "💾 Last ned resultat",
+        "download_processed": "⬇️ Last ned behandlet bilde",
+        "clear_results": "🗑️ Tøm alle resultater",
+        "footer": "**Billån Detektor** | Bygget med Streamlit 🚀",
+        "model_config": "Modellkonfigurasjon",
+        "model_path": "Modellsti (HEF-fil)",
+        "architecture": "Arkitektur",
+        "load_model": "🚀 Last modell",
+        "model_loaded": "✅ Modell lastet vellykket!",
+        "model_load_error": "❌ Feil ved lasting av modell:",
+        "model_not_found": "❌ Modellfil ikke funnet:",
+        "model_status": "Modellstatus"
+    }
+}
+
+def save_detection_crops(original_frame, inference_result, config_data, arch, output_dir, frame_id):
+    """
+    Extract detection bounding boxes from inference results and save cropped regions as image files.
+    """
+    import cv2
+    
+    # Process the raw inference results to get detection boxes
+    decoded_detections = decode_and_postprocess(inference_result, config_data, arch)
+    
+    # Check if we have valid detections
+    if not isinstance(decoded_detections, dict) or 'detection_boxes' not in decoded_detections:
+        return 0
+    
+    boxes = decoded_detections['detection_boxes']
+    scores = decoded_detections.get('detection_scores', [])
+    class_ids = decoded_detections.get('detection_classes', [])
+    
+    if len(boxes) == 0:
+        return 0
+    
+    # Create crops directory
+    crops_dir = os.path.join(output_dir, "crops")
+    os.makedirs(crops_dir, exist_ok=True)
+    
+    h, w = original_frame.shape[:2]
+    model_h, model_w = 640, 640  # Model input size
+    
+    # Calculate preprocessing scaling and padding
+    scale = min(model_w / w, model_h / h)
+    new_w, new_h = int(w * scale), int(h * scale)
+    x_offset = (model_w - new_w) // 2
+    y_offset = (model_h - new_h) // 2
+    
+    crop_count = 0
+    
+    for i, box in enumerate(boxes):
+        # Get confidence score and class if available
+        confidence = scores[i] if i < len(scores) else 1.0
+        class_id = int(class_ids[i]) if i < len(class_ids) else 0
+        
+        # Boxes are normalized to model input size (640x640)
+        xmin_norm, ymin_norm, xmax_norm, ymax_norm = box
+        
+        # Scale to model coordinates (640x640)
+        xmin_model = xmin_norm * model_w
+        ymin_model = ymin_norm * model_h
+        xmax_model = xmax_norm * model_w
+        ymax_model = ymax_norm * model_h
+        
+        # Remove padding to get scaled image coordinates
+        xmin_scaled = xmin_model - x_offset
+        ymin_scaled = ymin_model - y_offset
+        xmax_scaled = xmax_model - x_offset
+        ymax_scaled = ymax_model - y_offset
+        
+        # Scale back to original image coordinates
+        xmin = int(xmin_scaled / scale)
+        ymin = int(ymin_scaled / scale)
+        xmax = int(xmax_scaled / scale)
+        ymax = int(ymax_scaled / scale)
+        
+        # Clamp coordinates to image bounds
+        xmin = max(0, min(xmin, w-1))
+        xmax = max(0, min(xmax, w-1))
+        ymin = max(0, min(ymin, h-1))
+        ymax = max(0, min(ymax, h-1))
+        
+        # Skip if crop is too small
+        if (xmax - xmin) < 10 or (ymax - ymin) < 10:
+            continue
+            
+        # Extract crop
+        crop = original_frame[ymin:ymax, xmin:xmax]
+        
+        if crop.size > 0:
+            # Create filename with frame_id, crop_id, class_id, and confidence
+            crop_filename = f"frame_{frame_id:06d}_crop_{i:03d}_class_{class_id}_conf_{confidence:.3f}.jpg"
+            crop_path = os.path.join(crops_dir, crop_filename)
+            
+            # Save crop
+            cv2.imwrite(crop_path, crop)
+            crop_count += 1
+    
+    return crop_count
+
+def process_video_files():
+    """
+    Process all MP4 files in ~/video-capture directory and move them to processed folder after processing.
+    """
+    video_dir = os.path.expanduser("~/video-capture")
+    processed_dir = os.path.join(video_dir, "processed")
+    crops_dir = os.path.join(video_dir, "crops")
+    
+    # Create directories if they don't exist
+    os.makedirs(processed_dir, exist_ok=True)
+    os.makedirs(crops_dir, exist_ok=True)
+    
+    # Find all MP4 files in video directory (not in processed subdirectory)
+    mp4_files = [f for f in os.listdir(video_dir) 
+                 if f.endswith('.mp4') and os.path.isfile(os.path.join(video_dir, f))]
+    
+    if not mp4_files:
+        return [], 0
+    
+    processed_files = []
+    total_crops = 0
+    
+    # Load configuration
+    try:
+        config_data = load_json_file("config.json")
+    except:
+        # Default config for demo mode
+        config_data = {
+            "fast": {
+                "score_threshold": 0.5,
+                "nms_threshold": 0.4
+            },
+            "v5": {
+                "score_threshold": 0.5,
+                "nms_threshold": 0.4
+            },
+            "v8": {
+                "score_threshold": 0.5,
+                "nms_threshold": 0.4
+            }
+        }
+    
+    # Check if we have a loaded model
+    hailo_inference = st.session_state.hailo_inference
+    architecture = st.session_state.architecture
+    use_real_inference = hailo_inference is not None
+    
+    if use_real_inference:
+        height, width, _ = hailo_inference.get_input_shape()
+    
+    # Process each video file
+    for video_file in mp4_files:
+        video_path = os.path.join(video_dir, video_file)
+        
+        try:
+            # Open video
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                continue
+            
+            frame_count = 0
+            video_crops = 0
+            
+            # Process every 30th frame (1 per second at 30fps)
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                if frame_count % 30 == 0:  # Process every 30th frame
+                    if use_real_inference:
+                        try:
+                            # Real inference with loaded model
+                            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            preprocessed_frame = default_preprocess(rgb_frame, width, height)
+                            
+                            # Run inference
+                            result = hailo_inference.run_sync([preprocessed_frame])
+                            
+                            # Save detection crops
+                            crops = save_detection_crops(
+                                frame, result[0], config_data, architecture, video_dir, frame_count
+                            )
+                            video_crops += crops
+                            
+                        except Exception as e:
+                            st.error(f"Inference error on frame {frame_count}: {str(e)}")
+                    else:
+                        # Demo mode - simulate detection crops
+                        demo_crops = min(np.random.randint(0, 5), 3)  # 0-3 random crops per frame
+                        video_crops += demo_crops
+                
+                frame_count += 1
+            
+            cap.release()
+            total_crops += video_crops
+            
+            # Move processed video to processed directory
+            processed_path = os.path.join(processed_dir, video_file)
+            shutil.move(video_path, processed_path)
+            
+            processed_files.append({
+                'filename': video_file,
+                'crops': video_crops,
+                'frames': frame_count,
+                'inference_mode': 'real' if use_real_inference else 'demo'
+            })
+            
+        except Exception as e:
+            st.error(f"Error processing {video_file}: {str(e)}")
+            continue
+    
+    return processed_files, total_crops
+
+
+def process_crops_with_anpr():
+    """Process all crop images with ANPR and Norwegian registry lookup"""
+    try:
+        # Check for OpenAI API key
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            return False, "OpenAI API key not found. Please set OPENAI_API_KEY environment variable."
+        
+        output_dir = os.path.expanduser("~/video-capture")
+        crops_dir = os.path.join(output_dir, "crops")
+        processed_crops_dir = os.path.join(output_dir, "processed-crops")
+        
+        # Create processed-crops directory if it doesn't exist
+        os.makedirs(processed_crops_dir, exist_ok=True)
+        
+        if not os.path.exists(crops_dir):
+            return False, "No crops directory found. Please run inference first."
+        
+        # Find all crop images
+        crop_files = glob.glob(os.path.join(crops_dir, "*.jpg"))
+        
+        if not crop_files:
+            return False, "No crop images found. Please run inference first."
+        
+        # Initialize database
+        db_path = os.path.join(output_dir, "anpr_results.db")
+        
+        # Process each crop
+        total_crops = len(crop_files)
+        plates_found = 0
+        registry_matches = 0
+        database_records = 0
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        for i, crop_file in enumerate(crop_files):
+            try:
+                crop_filename = os.path.basename(crop_file)
+                status_text.text(f"Processing {crop_filename} ({i+1}/{total_crops})")
+                
+                # Read license plate using OpenAI
+                license_plate_text = read_license_plate(crop_file, api_key)
+                
+                if license_plate_text and license_plate_text.strip():
+                    plates_found += 1
+                    st.write(f"📋 Found plate: {license_plate_text} in {crop_filename}")
+                    
+                    # Check both Norwegian registry services
+                    registry_status, registry_info = check_both_norwegian_services(license_plate_text)
+                    
+                    if registry_status in ["yes", "partial"]:
+                        registry_matches += 1
+                        st.write(f"✅ Registry match: {license_plate_text} -> {registry_status}")
+                    else:
+                        st.write(f"❌ No registry match: {license_plate_text} -> {registry_status}")
+                    
+                    # Save to database
+                    success = upsert_loan_status(license_plate_text, registry_status, registry_info, db_path)
+                    if success:
+                        database_records += 1
+                
+                # Move processed crop to processed-crops directory
+                dest_path = os.path.join(processed_crops_dir, crop_filename)
+                shutil.move(crop_file, dest_path)
+                
+                # Update progress
+                progress_bar.progress((i + 1) / total_crops)
+                
+            except Exception as e:
+                st.error(f"❌ Error processing {crop_filename}: {str(e)}")
+                continue
+        
+        status_text.text("ANPR processing completed!")
+        
+        # Summary statistics
+        summary = {
+            "total_crops": total_crops,
+            "plates_found": plates_found,
+            "registry_matches": registry_matches,
+            "database_records": database_records,
+            "processed_crops_moved": total_crops
+        }
+        
+        return True, summary
+        
+    except Exception as e:
+        return False, f"Error in ANPR processing: {str(e)}"
+
+
+def check_api_keys():
+    """Check if required API keys are configured"""
+    openai_key = os.getenv("OPENAI_API_KEY")
+    vehicle_key = os.getenv("VEHICLE_API_KEY")
+    
+    return {
+        "openai_configured": openai_key is not None and openai_key != "your-openai-api-key-here",
+        "vehicle_configured": vehicle_key is not None and vehicle_key != "your-norwegian-vehicle-api-key-here",
+        "openai_key": openai_key,
+        "vehicle_key": vehicle_key
+    }
+
+# Page configuration
+st.set_page_config(
+    page_title="Car Loan Detector",
+    page_icon="🚗",
+    layout="wide"
+)
+
+# Initialize session state
+if 'captured_image' not in st.session_state:
+    st.session_state.captured_image = None
+if 'inference_result' not in st.session_state:
+    st.session_state.inference_result = None
+if 'processed_result' not in st.session_state:
+    st.session_state.processed_result = None
+if 'ffmpeg_process' not in st.session_state:
+    st.session_state.ffmpeg_process = None
+if 'recording' not in st.session_state:
+    st.session_state.recording = False
+if 'language' not in st.session_state:
+    st.session_state.language = 'en'
+if 'model_path' not in st.session_state:
+    st.session_state.model_path = '~/anprv2.hef'
+if 'architecture' not in st.session_state:
+    st.session_state.architecture = 'fast'
+if 'hailo_inference' not in st.session_state:
+    st.session_state.hailo_inference = None
+if 'anpr_result' not in st.session_state:
+    st.session_state.anpr_result = None
+
+# Language selector
+language = st.selectbox(
+    "Language / Språk",
+    options=['en', 'no'],
+    format_func=lambda x: 'English' if x == 'en' else 'Norsk (Bokmål)',
+    index=0 if st.session_state.language == 'en' else 1,
+    key='language_selector'
+)
+st.session_state.language = language
+
+# Get current translations
+t = translations[st.session_state.language]
+
+# Update page title and content with translations
+st.title(t["main_title"])
+st.markdown(t["subtitle"])
+
+# Sidebar for model configuration
+st.sidebar.header(t["model_config"])
+
+# Model path input
+model_path = st.sidebar.text_input(
+    t["model_path"],
+    value=st.session_state.model_path,
+    help="Path to your Hailo HEF model file"
+)
+st.session_state.model_path = model_path
+
+# Architecture selection
+architecture = st.sidebar.selectbox(
+    t["architecture"],
+    options=['fast', 'v5', 'v8'],
+    index=['fast', 'v5', 'v8'].index(st.session_state.architecture),
+    help="Model architecture type"
+)
+st.session_state.architecture = architecture
+
+# Load model button
+if st.sidebar.button(t["load_model"]):
+    model_path_expanded = os.path.expanduser(st.session_state.model_path)
+    if os.path.exists(model_path_expanded):
+        try:
+            with st.spinner("Loading Hailo model..."):
+                st.session_state.hailo_inference = HailoInfer(
+                    model_path_expanded,
+                    batch_size=1,
+                    output_type="FLOAT32"
+                )
+            st.sidebar.success(t["model_loaded"])
+        except Exception as e:
+            st.sidebar.error(f"{t['model_load_error']} {str(e)}")
+            st.session_state.hailo_inference = None
+    else:
+        st.sidebar.error(f"{t['model_not_found']} {model_path_expanded}")
+
+# Model status display
+st.sidebar.subheader(t["model_status"])
+if st.session_state.hailo_inference is not None:
+    st.sidebar.success("✅ Model loaded and ready")
+    st.sidebar.info(f"Architecture: {st.session_state.architecture}")
+    st.sidebar.info(f"Model: {os.path.basename(st.session_state.model_path)}")
+else:
+    st.sidebar.warning("⚠️ No model loaded (demo mode)")
+
+st.sidebar.markdown("---")
+
+# Configuration
+arch_type = "fast"  # Default architecture type
+
+# Main UI with three columns for the three steps
+col1, col2, col3 = st.columns(3)
+
+# Step 1: Capture
+with col1:
+    st.header(t["step1_capture"])
+    
+    # Recording status
+    if st.session_state.recording:
+        st.success(t["recording_in_progress"])
+        st.info(t["click_stop"])
+    else:
+        st.info(t["ready_to_record"])
+    
+    # Camera capture controls
+    col_start, col_stop = st.columns(2)
+    
+    with col_start:
+        if st.button(t["start_recording"], use_container_width=True, disabled=st.session_state.recording):
+            try:
+                # Set camera focus controls
+                st.info(t["setting_camera"])
+                subprocess.run([
+                    "/usr/bin/v4l2-ctl", 
+                    "--set-ctrl=focus_automatic_continuous=0"
+                ], check=True)
+                
+                subprocess.run([
+                    "/usr/bin/v4l2-ctl", 
+                    "--set-ctrl=focus_absolute=1"
+                ], check=True)
+                
+                # Start ffmpeg recording
+                st.info(t["starting_video"])
+                
+                # Create output directory if it doesn't exist
+                output_dir = os.path.expanduser("~/video-capture")
+                os.makedirs(output_dir, exist_ok=True)
+                
+                ffmpeg_cmd = [
+                    "/usr/bin/ffmpeg",
+                    "-f", "v4l2",
+                    "-input_format", "h264", 
+                    "-framerate", "30",
+                    "-video_size", "1920x1080",
+                    "-i", "/dev/video0",
+                    "-c:v", "copy",
+                    "-f", "segment",
+                    "-segment_time", "120",
+                    "-segment_format", "mp4",
+                    "-reset_timestamps", "1",
+                    "-strftime", "1",
+                    f"{output_dir}/output_%Y%m%d_%H%M%S.mp4"
+                ]
+                
+                # Start the process
+                st.session_state.ffmpeg_process = subprocess.Popen(
+                    ffmpeg_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
+                st.session_state.recording = True
+                st.success(t["recording_started"])
+                st.rerun()
+                
+            except subprocess.CalledProcessError as e:
+                st.error(f"{t['camera_error']} {str(e)}")
+            except FileNotFoundError:
+                st.error(t["not_found_error"])
+            except Exception as e:
+                st.error(f"{t['start_error']} {str(e)}")
+    
+    with col_stop:
+        if st.button(t["stop_recording"], use_container_width=True, disabled=not st.session_state.recording):
+            try:
+                if st.session_state.ffmpeg_process:
+                    # Send SIGINT to ffmpeg for clean shutdown
+                    st.session_state.ffmpeg_process.send_signal(signal.SIGINT)
+                    
+                    # Wait for process to finish (with timeout)
+                    try:
+                        st.session_state.ffmpeg_process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        # Force kill if it doesn't stop gracefully
+                        st.session_state.ffmpeg_process.kill()
+                        st.session_state.ffmpeg_process.wait()
+                    
+                    st.session_state.ffmpeg_process = None
+                    st.session_state.recording = False
+                    st.success(t["recording_stopped"])
+                    st.info(t["video_saved"])
+                    st.rerun()
+                
+            except Exception as e:
+                st.error(f"{t['stop_error']} {str(e)}")
+    
+    # Show recent captures
+    if not st.session_state.recording:
+        st.subheader(t["recent_captures"])
+        try:
+            # List recent video files
+            output_dir = os.path.expanduser("~/video-capture")
+            if os.path.exists(output_dir):
+                video_files = sorted([
+                    f for f in os.listdir(output_dir) 
+                    if f.startswith("output_") and f.endswith(".mp4")
+                ], reverse=True)[:5]  # Show last 5 files
+                
+                if video_files:
+                    for video_file in video_files:
+                        file_path = os.path.join(output_dir, video_file)
+                        file_size = os.path.getsize(file_path) / (1024*1024)  # MB
+                        st.write(f"📹 {video_file} ({file_size:.1f} MB)")
+                else:
+                    st.write(t["no_videos"])
+            else:
+                st.write(t["output_not_found"])
+                
+        except FileNotFoundError:
+            st.write(t["output_not_found"])
+        except Exception as e:
+            st.write(f"{t['list_error']} {str(e)}")
+    
+    # Display captured/uploaded image
+    if st.session_state.captured_image is not None:
+        # Convert BGR to RGB for display
+        display_image = cv2.cvtColor(st.session_state.captured_image, cv2.COLOR_BGR2RGB)
+        st.image(display_image, caption="Current Image", use_column_width=True)
+
+# Step 2: Infer
+with col2:
+    st.header(t["step2_infer"])
+    
+    if st.button(t["run_inference"], use_container_width=True):
+        # Check for video files to process
+        video_dir = os.path.expanduser("~/video-capture")
+        if not os.path.exists(video_dir):
+            st.error(t["output_not_found"])
+        else:
+            # Find MP4 files to process
+            mp4_files = [f for f in os.listdir(video_dir) 
+                        if f.endswith('.mp4') and os.path.isfile(os.path.join(video_dir, f))]
+            
+            if not mp4_files:
+                st.info(t["no_videos_to_process"])
+            else:
+                # Show inference mode
+                if st.session_state.hailo_inference is not None:
+                    st.info(f"🧠 Using real inference with {st.session_state.architecture} architecture")
+                else:
+                    st.warning("⚠️ Running in demo mode - load model for real inference")
+                
+                with st.spinner(t["processing_videos"]):
+                    processed_files, total_crops = process_video_files()
+                
+                if processed_files:
+                    st.success(t["inference_completed"])
+                    st.session_state.inference_result = {
+                        "processed_files": processed_files,
+                        "total_crops": total_crops
+                    }
+                    
+                    # Display processing results
+                    st.write(f"**{t['video_processed']}**")
+                    for file_info in processed_files:
+                        inference_mode = "🧠 Real" if file_info.get('inference_mode') == 'real' else "🎭 Demo"
+                        st.write(f"📹 {file_info['filename']} ({inference_mode})")
+                        st.write(f"  └─ {t['crops_saved']} {file_info['crops']}")
+                        st.write(f"  └─ {t['moved_to_processed']} processed/")
+                    
+                    st.info(f"**Total:** {len(processed_files)} videos, {total_crops} crops")
+                else:
+                    st.warning(t["processing_error"])
+    
+    # Display inference status
+    if st.session_state.inference_result is not None:
+        if isinstance(st.session_state.inference_result, dict) and "processed_files" in st.session_state.inference_result:
+            files_count = len(st.session_state.inference_result["processed_files"])
+            crops_count = st.session_state.inference_result["total_crops"]
+            st.write(f"**Status:** ✅ Processed {files_count} videos, {crops_count} crops saved")
+        else:
+            st.write(t["inference_status"])
+
+# Step 3: Postprocess
+with col3:
+    st.header(t["step3_postprocess"])
+    
+    # Check API keys status
+    api_status = check_api_keys()
+    
+    # Show API key configuration status
+    with st.expander("🔑 API Configuration", expanded=not (api_status["openai_configured"] and api_status["vehicle_configured"])):
+        col_api1, col_api2 = st.columns(2)
+        
+        with col_api1:
+            if api_status["openai_configured"]:
+                st.success("✅ OpenAI API Key: Configured")
+            else:
+                st.error("❌ OpenAI API Key: Not configured")
+                st.write("Required for license plate text extraction")
+        
+        with col_api2:
+            if api_status["vehicle_configured"]:
+                st.success("✅ Vehicle API Key: Configured")
+            else:
+                st.warning("⚠️ Vehicle API Key: Not configured")
+                st.write("Optional - will use web scraping fallback")
+        
+        if not api_status["openai_configured"]:
+            st.info("📝 To configure API keys:")
+            st.code("""
+# Edit the .env file in this directory:
+nano .env
+
+# Add your OpenAI API key:
+OPENAI_API_KEY=sk-your-actual-openai-key-here
+
+# Optionally add Norwegian Vehicle API key:
+VEHICLE_API_KEY=your-vehicle-api-key-here
+            """)
+    
+    # ANPR Processing button
+    can_process = api_status["openai_configured"]
+    
+    if st.button(t["run_postprocessing"], use_container_width=True, disabled=not can_process):
+        if not can_process:
+            st.error(t["openai_key_missing"])
+        else:
+            st.info(t["processing_crops"])
+            
+            # Process crops with ANPR
+            success, result = process_crops_with_anpr()
+            
+            if success:
+                # Display summary statistics
+                st.success(t["anpr_completed"])
+                
+                col_stat1, col_stat2 = st.columns(2)
+                with col_stat1:
+                    st.metric(t["crops_processed"], result["total_crops"])
+                    st.metric(t["plates_found"], result["plates_found"])
+                    st.metric(t["registry_matches"], result["registry_matches"])
+                
+                with col_stat2:
+                    st.metric(t["database_records"], result["database_records"])
+                    st.metric(t["crops_moved"], result["processed_crops_moved"])
+                
+                # Store result in session state
+                st.session_state.anpr_result = result
+                
+            else:
+                if "No crop images found" in str(result):
+                    st.warning(t["no_crops_found"])
+                else:
+                    st.error(f"❌ {result}")
+    
+    # Display ANPR results if available
+    if 'anpr_result' in st.session_state and st.session_state.anpr_result:
+        st.subheader("📊 ANPR Results Summary")
+        result = st.session_state.anpr_result
+        
+        # Statistics
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Total Crops", result["total_crops"])
+        with col2:
+            st.metric("License Plates Found", result["plates_found"])
+        with col3:
+            st.metric("Registry Matches", result["registry_matches"])
+        
+        # Database location
+        output_dir = os.path.expanduser("~/video-capture")
+        db_path = os.path.join(output_dir, "anpr_results.db")
+        st.info(f"💾 Results saved to: {db_path}")
+        
+        # Show processed crops directory
+        processed_crops_dir = os.path.join(output_dir, "processed-crops")
+        st.info(f"📁 Processed crops moved to: {processed_crops_dir}")
+
+# Results section
+if st.session_state.processed_result is not None:
+    st.header(t["results"])
+    
+    # Side-by-side comparison
+    col_orig, col_result = st.columns(2)
+    
+    with col_orig:
+        st.subheader(t["original_image"])
+        orig_display = cv2.cvtColor(st.session_state.captured_image, cv2.COLOR_BGR2RGB)
+        st.image(orig_display, use_column_width=True)
+    
+    with col_result:
+        st.subheader(t["segmentation_result"])
+        result_display = cv2.cvtColor(st.session_state.processed_result, cv2.COLOR_BGR2RGB)
+        st.image(result_display, use_column_width=True)
+    
+    # Download processed image
+    if st.button(t["download_result"]):
+        # Convert to PIL for saving
+        result_pil = Image.fromarray(cv2.cvtColor(st.session_state.processed_result, cv2.COLOR_BGR2RGB))
+        
+        # Save to temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_file:
+            result_pil.save(tmp_file.name, "JPEG")
+            
+            # Provide download link
+            with open(tmp_file.name, "rb") as file:
+                st.download_button(
+                    label=t["download_processed"],
+                    data=file.read(),
+                    file_name="instance_segmentation_result.jpg",
+                    mime="image/jpeg"
+                )
+
+# Clear results button
+if st.button(t["clear_results"]):
+    st.session_state.captured_image = None
+    st.session_state.inference_result = None
+    st.session_state.processed_result = None
+    st.experimental_rerun()
+
+# Footer
+st.markdown("---")
+st.markdown(t["footer"])

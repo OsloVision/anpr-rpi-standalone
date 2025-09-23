@@ -1,0 +1,116 @@
+# Environment files with sensitive data
+.env
+.env.local
+.env.production
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Testing
+.tox/
+.nox/
+.coverage
+.pytest_cache/
+cover/
+htmlcov/
+
+# Documentation
+docs/_build/
+.readthedocs.yaml
+
+# Model files
+*.hef
+*.onnx
+*.tflite
+*.pb
+*.pth
+*.pt
+models/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Video and image files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tiff
+
+# Output directories
+video-capture/
+crops/
+processed-crops/
+processed/
+output/
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+.cache/
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Streamlit
+.streamlit/
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
