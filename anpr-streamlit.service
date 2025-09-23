@@ -1,0 +1,28 @@
+[Unit]
+Description=ANPR Streamlit Application
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pyrat
+Group=pyrat
+WorkingDirectory=/home/pyrat/projects/anpr-standalone
+Environment=PATH=/home/pyrat/segenv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/home/pyrat/segenv/bin/streamlit run /home/pyrat/projects/anpr-standalone/streamlit_ui.py --server.port 8080 --server.address 0.0.0.0 --server.headless true --browser.gatherUsageStats false
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=anpr-streamlit
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/pyrat/video-capture /home/pyrat/projects/anpr-standalone /tmp
+# No special capabilities needed for port 8080
+
+[Install]
+WantedBy=multi-user.target
