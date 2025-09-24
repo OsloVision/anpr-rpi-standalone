@@ -249,17 +249,60 @@ translations = {
     }
 }
 
+def calculate_perceptual_hash(image, hash_size=8):
+    """
+    Calculate perceptual hash for duplicate detection.
+    Similar images will have similar hashes.
+    """
+    # Resize to hash_size x hash_size
+    resized = cv2.resize(image, (hash_size, hash_size))
+    
+    # Convert to grayscale if needed
+    if len(resized.shape) == 3:
+        resized = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+    
+    # Calculate average pixel value
+    avg = resized.mean()
+    
+    # Create binary hash based on whether pixels are above/below average
+    diff = resized > avg
+    
+    # Convert to hex string
+    return ''.join(['1' if pixel else '0' for pixel in diff.flatten()])
+
+def hamming_distance(hash1, hash2):
+    """Calculate Hamming distance between two binary hash strings."""
+    if len(hash1) != len(hash2):
+        return float('inf')
+    return sum(c1 != c2 for c1, c2 in zip(hash1, hash2))
+
 def save_detection_crops(original_frame, inference_result, config_data, arch, output_dir, frame_id):
     """
     Extract detection bounding boxes from inference results and save cropped regions as image files.
+    Avoids saving duplicate crops based on image content similarity using perceptual hashing.
     """
     import cv2
+    import hashlib
     
     # Process the raw inference results to get detection boxes
-    decoded_detections = decode_and_postprocess(inference_result, config_data, arch)
+    try:
+        decoded_detections = decode_and_postprocess(inference_result, config_data, arch)
+        
+        # Debug: Check postprocessing results
+        if isinstance(decoded_detections, dict):
+            print(f"Postprocessing returned dict with keys: {list(decoded_detections.keys())}")
+            if 'detection_boxes' in decoded_detections:
+                print(f"Found {len(decoded_detections['detection_boxes'])} detection boxes")
+        else:
+            print(f"Postprocessing returned: {type(decoded_detections)}")
+        
+    except Exception as e:
+        print(f"Error in decode_and_postprocess: {e}")
+        return 0
     
     # Check if we have valid detections
     if not isinstance(decoded_detections, dict) or 'detection_boxes' not in decoded_detections:
+        print("No valid detections found")
         return 0
     
     boxes = decoded_detections['detection_boxes']
@@ -272,6 +315,24 @@ def save_detection_crops(original_frame, inference_result, config_data, arch, ou
     # Create crops directory
     crops_dir = os.path.join(output_dir, "crops")
     os.makedirs(crops_dir, exist_ok=True)
+    
+    # Load existing image hashes to avoid duplicates
+    hash_file = os.path.join(crops_dir, "image_hashes.txt")
+    existing_exact_hashes = set()
+    existing_perceptual_hashes = []
+    
+    if os.path.exists(hash_file):
+        try:
+            with open(hash_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and '|' in line:
+                        parts = line.split('|')
+                        if len(parts) >= 2:
+                            existing_exact_hashes.add(parts[0])
+                            existing_perceptual_hashes.append(parts[1])
+        except:
+            pass  # Continue if can't read hash file
     
     h, w = original_frame.shape[:2]
     model_h, model_w = 640, 640  # Model input size
@@ -324,15 +385,73 @@ def save_detection_crops(original_frame, inference_result, config_data, arch, ou
         crop = original_frame[ymin:ymax, xmin:xmax]
         
         if crop.size > 0:
+            # Calculate both exact and perceptual hashes for duplicate detection
+            crop_resized = cv2.resize(crop, (64, 64))
+            crop_gray = cv2.cvtColor(crop_resized, cv2.COLOR_BGR2GRAY)
+            
+            # Exact hash (MD5 of normalized image data)
+            exact_hash = hashlib.md5(crop_gray.tobytes()).hexdigest()
+            
+            # Perceptual hash for similarity detection
+            perceptual_hash = calculate_perceptual_hash(crop_gray)
+            
+            # Check for exact duplicates first
+            if exact_hash in existing_exact_hashes:
+                continue  # Skip exact duplicate
+            
+            # Check for similar images using perceptual hash
+            is_similar = False
+            similarity_threshold = 8  # Allow up to 8 bit differences (out of 64 bits)
+            
+            for existing_phash in existing_perceptual_hashes:
+                if hamming_distance(perceptual_hash, existing_phash) <= similarity_threshold:
+                    is_similar = True
+                    break
+            
+            if is_similar:
+                continue  # Skip similar image
+            
             # Create filename with frame_id, crop_id, class_id, and confidence
             crop_filename = f"frame_{frame_id:06d}_crop_{i:03d}_class_{class_id}_conf_{confidence:.3f}.jpg"
             crop_path = os.path.join(crops_dir, crop_filename)
             
             # Save crop
             cv2.imwrite(crop_path, crop)
+            
+            # Add hashes to existing sets and save to file
+            existing_exact_hashes.add(exact_hash)
+            existing_perceptual_hashes.append(perceptual_hash)
+            
+            try:
+                with open(hash_file, 'a') as f:
+                    f.write(f"{exact_hash}|{perceptual_hash}\n")
+            except:
+                pass  # Continue if can't write hash file
+            
             crop_count += 1
     
+    # Periodically clean up hash file to prevent it from growing too large
+    if crop_count > 0:
+        cleanup_hash_file(hash_file)
+    
     return crop_count
+
+def cleanup_hash_file(hash_file, max_entries=10000):
+    """
+    Clean up hash file if it gets too large to maintain performance.
+    Keeps only the most recent entries.
+    """
+    try:
+        if os.path.exists(hash_file):
+            with open(hash_file, 'r') as f:
+                lines = f.readlines()
+            
+            if len(lines) > max_entries:
+                # Keep only the last max_entries
+                with open(hash_file, 'w') as f:
+                    f.writelines(lines[-max_entries:])
+    except:
+        pass  # Ignore cleanup errors
 
 def process_video_files():
     """
@@ -381,29 +500,73 @@ def process_video_files():
     architecture = st.session_state.architecture
     use_real_inference = hailo_inference is not None
     
+    # Debug model status
+    print(f"Processing videos - Model loaded: {use_real_inference}, Architecture: {architecture}")
+    if hasattr(st.session_state, 'model_path'):
+        print(f"Model path: {st.session_state.model_path}")
+    
     if use_real_inference:
-        height, width, _ = hailo_inference.get_input_shape()
+        try:
+            height, width, _ = hailo_inference.get_input_shape()
+            print(f"Model input shape: {width}x{height}")
+        except Exception as e:
+            print(f"Error getting model shape: {e}")
+            use_real_inference = False
+    
+    # Set OpenCV environment variables for better video handling
+    os.environ['OPENCV_FFMPEG_READ_ATTEMPTS'] = '10000'
     
     # Process each video file
     for video_file in mp4_files:
         video_path = os.path.join(video_dir, video_file)
         
         try:
-            # Open video
-            cap = cv2.VideoCapture(video_path)
+            # Open video with specific backend for better compatibility
+            cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
             if not cap.isOpened():
+                print(f"Failed to open video: {video_file}")
+                continue
+                
+            # Get video properties for debugging
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_count_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            width_orig = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height_orig = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            
+            print(f"Processing video: {video_file}")
+            print(f"  Resolution: {width_orig}x{height_orig}")
+            print(f"  FPS: {fps}")
+            print(f"  Total frames: {frame_count_total}")
+            
+            # Skip if video properties are invalid
+            if fps <= 0 or frame_count_total <= 0:
+                print(f"  Invalid video properties, skipping")
+                cap.release()
                 continue
             
             frame_count = 0
             video_crops = 0
             
-            # Process every 30th frame (1 per second at 30fps)
+            # Calculate frame skip based on actual FPS (aim for 1 frame per second)
+            frame_skip = max(1, int(fps)) if fps > 0 else 30
+            print(f"  Processing every {frame_skip} frames")
+            
+            # Process frames with better error handling
+            consecutive_failures = 0
+            max_consecutive_failures = 100
+            
             while True:
                 ret, frame = cap.read()
                 if not ret:
-                    break
+                    consecutive_failures += 1
+                    if consecutive_failures > max_consecutive_failures:
+                        print(f"  Too many consecutive read failures, stopping")
+                        break
+                    continue
+                else:
+                    consecutive_failures = 0
                 
-                if frame_count % 30 == 0:  # Process every 30th frame
+                if frame_count % frame_skip == 0:  # Process frames at ~1 per second
                     if use_real_inference:
                         try:
                             # Real inference with loaded model
@@ -413,14 +576,23 @@ def process_video_files():
                             # Run inference
                             result = hailo_inference.run_sync([preprocessed_frame])
                             
-                            # Save detection crops
-                            crops = save_detection_crops(
-                                frame, result[0], config_data, architecture, video_dir, frame_count
-                            )
-                            video_crops += crops
+                            # Debug: Check if we got results
+                            if result and len(result) > 0:
+                                # Save detection crops
+                                crops = save_detection_crops(
+                                    frame, result[0], config_data, architecture, video_dir, frame_count
+                                )
+                                video_crops += crops
+                                
+                                # Debug info (only for first few frames)
+                                if frame_count < 90:  # First 3 processed frames
+                                    print(f"Frame {frame_count}: Found {crops} crops, result shape: {result[0].shape if hasattr(result[0], 'shape') else 'unknown'}")
+                            else:
+                                print(f"Frame {frame_count}: No inference results returned")
                             
                         except Exception as e:
                             st.error(f"Inference error on frame {frame_count}: {str(e)}")
+                            print(f"Full inference error on frame {frame_count}: {str(e)}")
                     else:
                         # Demo mode - simulate detection crops
                         demo_crops = min(np.random.randint(0, 5), 3)  # 0-3 random crops per frame
@@ -586,16 +758,29 @@ if 'anpr_result' not in st.session_state:
 # Auto-load model with defaults if not already loaded
 if st.session_state.hailo_inference is None and HAILO_AVAILABLE:
     model_path_expanded = os.path.expanduser(st.session_state.model_path)
+    print(f"Attempting to load model from: {model_path_expanded}")
+    print(f"Model file exists: {os.path.exists(model_path_expanded)}")
+    
     if os.path.exists(model_path_expanded):
         try:
+            print("Loading Hailo model...")
             st.session_state.hailo_inference = HailoInfer(
                 model_path_expanded,
                 batch_size=1,
                 output_type="FLOAT32"
             )
-        except Exception:
-            # Silently continue if model loading fails
+            print("✅ Model loaded successfully!")
+        except Exception as e:
+            print(f"❌ Model loading failed: {e}")
+            # Continue without model
             pass
+    else:
+        print(f"❌ Model file not found: {model_path_expanded}")
+else:
+    if not HAILO_AVAILABLE:
+        print("❌ Hailo not available")
+    if st.session_state.hailo_inference is not None:
+        print("✅ Model already loaded")
 
 # Language selector
 language = st.selectbox(
